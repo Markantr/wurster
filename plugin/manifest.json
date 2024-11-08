@@ -1,0 +1,13 @@
+{
+  "manifest_version": 3,
+  "name": "Wurster",
+  "version": "1.0",
+  "permissions": ["scripting", "activeTab", "clipboardWrite"],
+  "host_permissions": ["http://localhost:5000/*"],
+  "action": {
+    "default_title": "Wurster Action"
+  },
+  "background": {
+    "service_worker": "background.js"
+  }
+}
