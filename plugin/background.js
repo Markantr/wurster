@@ -11,7 +11,7 @@ chrome.action.onClicked.addListener(async (tab) => {
 
 async function copyQuestionAndAnswer() {
   // Get question
-  const questionElement = document.querySelector("div.ck-content p");
+  const questionElement = document.querySelector("form.fixform");
   let questionText = questionElement ? questionElement.textContent.trim() : "";
 
   // Get answer fieldset
@@ -33,7 +33,6 @@ async function copyQuestionAndAnswer() {
     const table = answerFieldset.querySelector("table");
 
     if (table) {
-      // Handle matching table type question
       const rows = table.querySelectorAll("tbody tr");
       let terms = [];
       let answers = [];
@@ -41,10 +40,8 @@ async function copyQuestionAndAnswer() {
       // Skip the header row (index 0)
       for (let i = 1; i < rows.length; i++) {
         const row = rows[i];
-        const term = row.querySelector(".fixcol p strong")?.textContent.trim();
-        const answer = row
-          .querySelector(".sourcecol p span")
-          ?.textContent.trim();
+        const term = row.querySelector(".fixcol p")?.textContent.trim();
+        const answer = row.querySelector(".sourcecol p")?.textContent.trim();
 
         if (term && answer) {
           terms.push(term);
