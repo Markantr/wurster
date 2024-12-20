@@ -12,7 +12,8 @@ chrome.action.onClicked.addListener(async (tab) => {
 async function copyQuestionAndAnswer() {
   // Get question
   const questionElement = document.querySelector("form.fixform");
-  let questionText = questionElement ? questionElement.textContent.trim() : "";
+  const questionContent = questionElement.querySelector(".ck-content");
+  let questionText = questionContent ? questionContent.textContent.trim() : "";
 
   // Get answer fieldset
   const fieldsets = document.getElementsByTagName("fieldset");
@@ -33,11 +34,11 @@ async function copyQuestionAndAnswer() {
     const table = answerFieldset.querySelector("table");
 
     if (table) {
+      // Handle table-based matching questions
       const rows = table.querySelectorAll("tbody tr");
       let terms = [];
       let answers = [];
 
-      // Skip the header row (index 0)
       for (let i = 1; i < rows.length; i++) {
         const row = rows[i];
         const term = row.querySelector(".fixcol p")?.textContent.trim();
@@ -49,7 +50,6 @@ async function copyQuestionAndAnswer() {
         }
       }
 
-      // Format in the desired structure using numbers and letters
       const formattedTerms = terms
         .map((term, index) => `${index + 1}. "${term}"`)
         .join("\n");
@@ -62,27 +62,36 @@ async function copyQuestionAndAnswer() {
 
       formattedText = `${formattedTerms}\n\n${formattedAnswers}`;
     } else {
-      // Handle original gap text type question
-      const selects = answerFieldset.querySelectorAll("select");
-      let answerText = answerFieldset.querySelector("p").textContent;
+      // Handle gap text questions
+      const contentDiv = answerFieldset.querySelector(".ck-content");
+      const textContainer = contentDiv.querySelector("p, pre");
+      let answerText = "";
 
-      // Process each select element
-      selects.forEach((select) => {
-        const options = Array.from(select.options)
-          .filter((option) => option.text.trim() !== "")
-          .map((option) => option.text.trim());
+      if (textContainer) {
+        // Create a document fragment to work with
+        const container = document.createElement("div");
+        container.innerHTML = textContainer.innerHTML;
 
-        // Replace the select content with the options in brackets
-        answerText = answerText.replace(
-          select.textContent,
-          `[${options.join(" | ")}]`
-        );
-      });
+        // Process each select element
+        const selects = container.querySelectorAll("select");
+        selects.forEach((select) => {
+          const options = Array.from(select.options)
+            .filter((option) => option.text.trim() !== "")
+            .map((option) => option.text.trim());
 
-      formattedText = `${questionText}\n${answerText.trim()}`;
+          // Create a placeholder for the select element
+          const placeholder = document.createTextNode(
+            `[${options.join(" | ")}]`
+          );
+          select.parentNode.replaceChild(placeholder, select);
+        });
+
+        // Get the text content with replaced selects
+        answerText = container.textContent.trim();
+      }
+
+      formattedText = `${questionText}\n${answerText}`;
     }
-
-    console.log({ formattedText });
 
     // Send the formatted text to your local server
     await fetch("http://localhost:5000/log", {
