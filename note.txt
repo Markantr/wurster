@@ -1,0 +1,5 @@
+    <w:p>
+      <w:r>
+        <w:t answer="true">an architecture, multiple, independent, a single</w:t>
+      </w:r>
+    </w:p>

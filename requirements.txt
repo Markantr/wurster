@@ -3,3 +3,4 @@ pywin32
 lxml
 anthropic
 docx-live-reload
+watchdog

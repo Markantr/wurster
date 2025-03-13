@@ -11,8 +11,8 @@ from pathlib import Path
 import pythoncom
 from lxml import etree
 import anthropic
-from flask import Flask, request, jsonify
-import signal
+from watchdog.observers import Observer
+from watchdog.events import FileSystemEventHandler
 
 if sys.version_info < (3, 8):
     import importlib_metadata
@@ -23,6 +23,7 @@ else:
 class Paths:
     def __init__(self, path) -> Path:
         self.path = Path(path).absolute()
+        self.question_path = self.path.parent / "question.txt"
 
     @property
     def preview_copy_path(self) -> Path:
@@ -45,17 +46,22 @@ class FilesWatcher:
         self.watch_paths = watch_paths
         self.modified = {}
         self.stopped = True
+        self.ignore_next_change = False
 
     @property
     def changed(self) -> bool:
-        if self.stopped:
+        if self.stopped or self.ignore_next_change:
+            if self.ignore_next_change:
+                # Reset flag after ignoring one change
+                self.ignore_next_change = False
             return False
 
         is_changed = False
         for path, modified in self.modified.items():
-            self.modified[path] = os.path.getmtime(path)
-            if not is_changed and self.modified[path] != modified:
+            current_mod_time = os.path.getmtime(path)
+            if not is_changed and current_mod_time != modified:
                 is_changed = True
+                self.modified[path] = current_mod_time
         return is_changed
 
     def update_modified(self):
@@ -70,11 +76,31 @@ class FilesWatcher:
         self.stopped = False
 
 
+class QuestionFileHandler(FileSystemEventHandler):
+    def __init__(self):
+        super().__init__()
+        self.last_processed_time = 0
+        self.debounce_seconds = 1.0  # Debounce time to avoid multiple rapid triggers
+
+    def on_modified(self, event):
+        current_time = time.time()
+        # Only process if enough time has passed since last processing
+        if (current_time - self.last_processed_time) > self.debounce_seconds:
+            if event.src_path == str(Shared.paths.question_path):
+                print(f"Question file modified: {event.src_path}")
+                with open(event.src_path, "r", encoding="utf-8") as file:
+                    content = file.read().strip()
+                    process_question(content)
+                self.last_processed_time = current_time
+
+
 class Shared:
     paths: Paths
     docx_watcher: FilesWatcher
     xmls_watcher: FilesWatcher
     cmds: queue.Queue
+    update_lock = threading.Lock()
+    operation_in_progress = False
 
 
 def modify_xml_file(filepath, text):
@@ -126,46 +152,25 @@ def modify_xml_file(filepath, text):
     return True
 
 
-def process_with_claude(question, type):
+def process_with_claude(question):
     try:
         client = anthropic.Anthropic(
             api_key=""
         )
 
-        if type == "gaptext":
-            prompt = f"""
-                   For each [...] bracket, return only ONE correct answer.
-                   Return answers separated by comma.
-                   Example input: [big | small] elephant drinks [hot | cold | warm] water
-                   Example output: small, cold
-                   Do not include any explanations, the terms, or additional text.
-
-                   {question}
-                   """
-        elif type == "matching":
-            prompt = f"""
-                        Please analyze this matching question and match the numbered items with their corresponding letters. Return only the number -> letter pairs in the format:
-                        Example output:
-                        1 -> b
-                        2 -> c
-                        3 -> a
-                        ...
-                        Do not include any explanations, the terms, or additional text.
-
-                        {question}
-                        """
-
         message = client.messages.create(
-            model="claude-3-5-sonnet-20241022",
-            max_tokens=1000,
+            model="claude-3-7-sonnet-20250219",
+            max_tokens=10000,
             temperature=0,
             messages=[
                 {
                     "role": "user",
-                    "content": prompt
+                    "content": question
                 }
             ]
         )
+
+        print(message)
 
         return message.content[0].text
 
@@ -173,59 +178,60 @@ def process_with_claude(question, type):
         return str(e)
 
 
-def run_flask_app():
-    app = Flask(__name__)
+def process_question(question):
+    # Use a lock to prevent multiple operations happening at once
+    with Shared.update_lock:
+        if Shared.operation_in_progress:
+            print("Operation already in progress, skipping...")
+            return
 
-    @app.after_request
-    def after_request(response):
-        response.headers.add('Access-Control-Allow-Origin', '*')
-        response.headers.add('Access-Control-Allow-Headers', 'Content-Type,Authorization')
-        response.headers.add('Access-Control-Allow-Methods', 'POST,OPTIONS')
-        return response
-
-    @app.route('/log', methods=['POST', 'OPTIONS'])
-    def log_request():
-        if request.method == 'OPTIONS':
-            return jsonify({"status": "ok"}), 200
+        Shared.operation_in_progress = True
 
         try:
-            content = request.get_json(silent=True)
-            print(f"Question: {content.get('question', 'N/A')}")
-            print(f"Answer: {content.get('answer', 'N/A')}")
-            print(f"Type: {content.get('type', 'N/A')}")
-            response = process_with_claude(content.get('answer', 'N/A'), content.get('type', 'N/A'))
-            print(f"Response: {response}")
+            print(f"Processing question: {question}")
+            response = process_with_claude(question)
+            print(f"Claude's response: {response}")
+
+            # Tell watchers to ignore changes we're about to make
+            Shared.docx_watcher.ignore_next_change = True
+            Shared.xmls_watcher.ignore_next_change = True
 
             document_xml_path = Shared.paths.ext_xmls[0]
-
             modify_xml_file(document_xml_path, response)
 
-            # Trigger an update in the Word document
-            # Shared.cmds.put("update")
-
-            return jsonify({"status": "success", "message": "Request logged and document updated"}), 200
-
-        except Exception as e:
-            print(f"Error logging request: {str(e)}")
-            return jsonify({"status": "error", "message": str(e)}), 500
-
-    app.run(host='localhost', port=5000, debug=False)
+            # Use a single update command to avoid multiple reload cycles
+            Shared.cmds.put("update_single")
+        finally:
+            Shared.operation_in_progress = False
 
 
 def watcher_thread(cmds: queue.Queue):
+    # Add debounce mechanism
+    last_docx_change = 0
+    last_xml_change = 0
+    debounce_time = 1.0  # seconds
+
     while True:
+        current_time = time.time()
+
         if Shared.docx_watcher.changed:
-            print("Change in docx file detected!")
-            cmds.put("reload")
+            # Only act on changes that are not too close together
+            if current_time - last_docx_change > debounce_time:
+                print("Change in docx file detected!")
+                cmds.put("reload")
+                last_docx_change = current_time
 
         if Shared.xmls_watcher.changed:
-            print("Change in extracted xmls detected!")
-            cmds.put("update")
+            # Only act on changes that are not too close together
+            if current_time - last_xml_change > debounce_time:
+                print("Change in extracted xmls detected!")
+                cmds.put("update")
+                last_xml_change = current_time
 
         time.sleep(0.1)
 
 
-def update(parser):
+def update(parser, prevent_reload=False):
     try:
         for path in Shared.paths.ext_xmls:
             etree.parse(path, parser)
@@ -234,9 +240,29 @@ def update(parser):
 
     print("updating..")
 
+    # If we want to prevent the update from triggering a reload
+    if prevent_reload:
+        Shared.docx_watcher.ignore_next_change = True
+
     with zipfile.ZipFile(Shared.paths.path, "w") as file:
         for path in Shared.paths.ext_dirpath.glob("**/*"):
             file.write(path, path.relative_to(Shared.paths.ext_dirpath))
+
+
+def setup_question_file_watcher():
+    # Create the question.txt file if it doesn't exist
+    if not Shared.paths.question_path.exists():
+        with open(Shared.paths.question_path, 'w', encoding='utf-8') as f:
+            f.write("Enter your question here and save the file.")
+
+    # Set up the file watcher
+    event_handler = QuestionFileHandler()
+    observer = Observer()
+    observer.schedule(event_handler, str(Shared.paths.question_path.parent), recursive=False)
+    observer.start()
+    print(f"Watching question file at: {Shared.paths.question_path}")
+
+    return observer
 
 
 def preview_thread(cmds: queue.Queue):
@@ -249,7 +275,16 @@ def preview_thread(cmds: queue.Queue):
     Shared.docx_watcher.start()
     Shared.xmls_watcher.start()
 
+    # Set up the question file watcher
+    observer = setup_question_file_watcher()
+
+    # Keep track of when last reload happened to prevent rapid reloads
+    last_reload_time = 0
+    reload_debounce_time = 2.0  # seconds
+
     while True:
+        current_time = time.time()
+
         try:
             cmd = cmds.get(timeout=1)
         except queue.Empty:
@@ -260,17 +295,26 @@ def preview_thread(cmds: queue.Queue):
             except pythoncom.com_error:
                 print()
                 print("Word was closed. exiting..")
+                observer.stop()
+                observer.join()
                 exit()
 
-        if cmd == "reload":
+        if cmd == "reload" and (current_time - last_reload_time > reload_debounce_time):
             print("reloading..")
+            last_reload_time = current_time
             doc = run_preview(word_app, doc, parser)
 
         elif cmd == "update":
             update(parser)
 
+        elif cmd == "update_single":
+            # Special command for single updates that shouldn't trigger reload cascade
+            update(parser, prevent_reload=True)
+
         elif cmd == "quit":
             print("exiting..")
+            observer.stop()
+            observer.join()
             try:
                 if doc in word_app.Documents:
                     doc.Close()
@@ -321,7 +365,7 @@ def main():
 
     parser = argparse.ArgumentParser(
         prog="docx-live-reload",
-        description="Preview a Docx file in MS Word with live updates from Flask API.",
+        description="Preview a Docx file in MS Word with live updates from question.txt.",
         epilog="Created by idtareq@gmail.com",
     )
 
@@ -352,9 +396,6 @@ def main():
     threading.Thread(target=watcher_thread, daemon=True, args=(Shared.cmds,)).start()
     threading.Thread(target=input_thread, daemon=True, args=(Shared.cmds,)).start()
     threading.Thread(target=preview_thread, args=(Shared.cmds,)).start()
-
-    # Start Flask app in a separate thread
-    threading.Thread(target=run_flask_app, daemon=True).start()
 
 
 if __name__ == "__main__":
